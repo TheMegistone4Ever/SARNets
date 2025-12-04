@@ -32,6 +32,7 @@ for url in urls:
         "aria2c",
         "-x", "16", "-s", "16", "-k", "1M",
         "-d", output_dir,
+        "-o", filename,
         url
     ])
     print(f"Finished downloading {filename}")
