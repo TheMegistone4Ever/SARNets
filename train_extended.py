@@ -23,7 +23,7 @@ TEMP_DIR = "temp_results"
 
 CHANNEL_MASKS = ["100000", "111000", "100111", "111111", "000111"]
 NUM_CLASSES = 4
-MAX_EPOCHS = 100
+MAX_EPOCHS = 0
 PATIENCE = 15
 
 BATCH_SIZES = [1, 2, 4, 8]
@@ -133,12 +133,40 @@ def validate_epoch(model, dataloader, criterion, device):
     return metrics
 
 
+def update_map_status(exp_id, lock):
+    if lock is None:
+        return
+
+    with lock:
+        rows = []
+        with open(EXP_MAP_FILE, mode="r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            rows = list(reader)
+
+        updated = False
+        for row in rows:
+            if int(row[0]) == exp_id:
+                row[-1] = "True"
+                updated = True
+                break
+
+        if updated:
+            with open(EXP_MAP_FILE, mode="w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                writer.writerows(rows)
+
+
 def run_experiment(args):
-    exp_id, config, train_names, val_names = args
+    exp_id, config, train_names, val_names, lock = args
     batch_size, input_size, lr, (loss_name, lovasz_weight), mask = config
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     temp_file = os.path.join(TEMP_DIR, f"exp_{exp_id}.csv")
+
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
 
     train_transform = A.Compose([
         A.HorizontalFlip(p=0.5),
@@ -207,6 +235,8 @@ def run_experiment(args):
         writer = csv.writer(f)
         writer.writerows(results_buffer)
 
+    update_map_status(exp_id, lock)
+
     del model
     del optimizer
     del criterion
@@ -260,20 +290,63 @@ def main():
     train_names = all_images[:train_size]
     val_names = all_images[train_size:train_size + 50]
 
-    with open(EXP_MAP_FILE, mode="w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["exp_id", "input_size", "batch_size", "lr", "loss_name", "lovasz_weight", "channel_mask"])
-        for i, config in enumerate(grid):
-            writer.writerow([i, config[1], config[0], config[2], config[3][0], config[3][1], config[4]])
+    os.makedirs(TEMP_DIR, exist_ok=True)
+
+    resume_mode = os.path.exists(EXP_MAP_FILE)
+    tasks_to_run = []
+
+    if not resume_mode:
+        print("Starting new grid search. Creating map file...")
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR)
+        os.makedirs(TEMP_DIR)
+
+        with open(EXP_MAP_FILE, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["exp_id", "input_size", "batch_size", "lr", "loss_name", "lovasz_weight", "channel_mask",
+                             "is_finished"])
+            for i, config in enumerate(grid):
+                writer.writerow([i, config[1], config[0], config[2], config[3][0], config[3][1], config[4], "False"])
+                tasks_to_run.append((i, config))
+    else:
+        print("Resuming from existing map file...")
+        last_exp_id = 0
+        with open(EXP_MAP_FILE, mode="r") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            for i, row in enumerate(reader):
+                is_finished = row[-1]
+                exp_id = int(row[0])
+
+                if is_finished == "True":
+                    last_exp_id = exp_id
+                    continue
+
+                partial_res_file = os.path.join(TEMP_DIR, f"exp_{exp_id}.csv")
+                if os.path.exists(partial_res_file):
+                    os.remove(partial_res_file)
+                    print(f"Resetting incomplete experiment {exp_id}")
+
+                tasks_to_run.append((exp_id, grid[i]))
 
     print(f"Total combinations: {len(grid)}")
+    print(f"Last completed experiment ID: {last_exp_id}")
+    print(f"Tasks remaining to run: {len(tasks_to_run)}")
 
-    tasks = []
-    for i, config in enumerate(grid):
-        tasks.append((i, config, train_names, val_names))
+    if len(tasks_to_run) == 0:
+        print("All tasks completed.")
+        merge_results()
+        return
+
+    manager = mp.Manager()
+    file_lock = manager.Lock()
+
+    final_tasks = []
+    for exp_id, config in tasks_to_run:
+        final_tasks.append((exp_id, config, train_names, val_names, file_lock))
 
     with mp.Pool(processes=MAX_CONCURRENT_JOBS) as pool:
-        list(tqdm(pool.imap_unordered(run_experiment, tasks), total=len(tasks), desc="Grid Search"))
+        list(tqdm(pool.imap_unordered(run_experiment, final_tasks), total=len(final_tasks), desc="Grid Search"))
 
     merge_results()
 
