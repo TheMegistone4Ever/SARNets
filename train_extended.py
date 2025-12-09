@@ -293,6 +293,8 @@ def main():
     resume_mode = os.path.exists(EXP_MAP_FILE)
     tasks_to_run = []
 
+    last_exp_id = -1
+
     if not resume_mode:
         print("Starting new grid search. Creating map file...")
         if os.path.exists(TEMP_DIR):
@@ -308,7 +310,6 @@ def main():
                 tasks_to_run.append((i, config))
     else:
         print("Resuming from existing map file...")
-        last_exp_id = 0
         with open(EXP_MAP_FILE, mode="r") as f:
             reader = csv.reader(f)
             header = next(reader)
@@ -328,7 +329,7 @@ def main():
                 tasks_to_run.append((exp_id, grid[i]))
 
     print(f"Total combinations: {len(grid)}")
-    print(f"Last completed experiment ID: {last_exp_id}")
+    print(f"Last completed experiment ID: {last_exp_id}" if last_exp_id >= 0 else "No completed experiments found.")
     print(f"Tasks remaining to run: {len(tasks_to_run)}")
 
     if len(tasks_to_run) == 0:
