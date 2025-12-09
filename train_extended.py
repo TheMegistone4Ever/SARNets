@@ -21,22 +21,20 @@ EXP_MAP_FILE = "grid_search_map.csv"
 RESULTS_FILE = "grid_search_metrics.csv"
 TEMP_DIR = "temp_results"
 
-CHANNEL_MASKS = ["100000", "111000", "100111", "111111", "000111"]
+CHANNEL_MASKS = ["100000", "111000", "111111", "000111"]
 NUM_CLASSES = 4
 MAX_EPOCHS = 100
 PATIENCE = 15
 
-BATCH_SIZES = [1, 2, 4, 8]
-INPUT_SIZES = [372, 512, 1024]
-LEARNING_RATES = [3e-5, 1e-4, 3e-4]
+BATCH_SIZES = [4, 8]
+INPUT_SIZES = [372, 1024]
+LEARNING_RATES = [3e-5, 3e-4]
 
 LOSS_CONFIGS = [
     ("LovaszSoftmaxLoss", None),
     ("FocalLoss", None),
     ("CombinedLoss_0.25", 0.25),
-    ("CombinedLoss_0.50", 0.50),
     ("CombinedLoss_0.75", 0.75),
-    ("CombinedLoss_1.00", 1.00),
 ]
 
 MAX_CONCURRENT_JOBS = 4
