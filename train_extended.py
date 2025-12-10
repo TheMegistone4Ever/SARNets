@@ -168,9 +168,9 @@ def run_experiment(args):
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     temp_file = os.path.join(TEMP_DIR, f"exp_{exp_id}.csv")
-
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
+    weights_dir = os.path.join(CHECKPOINT_DIR, f"exp_{exp_id}")
+    os.makedirs(weights_dir, exist_ok=True)
+    last_ckpt_path = os.path.join(weights_dir, "last_model.pth")
 
     train_transform = A.Compose([
         A.HorizontalFlip(p=0.5),
@@ -198,15 +198,29 @@ def run_experiment(args):
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
 
+    start_epoch = 0
     best_miou = 0.0
     patience_counter = 0
-
-    weights_dir = os.path.join(CHECKPOINT_DIR, f"exp_{exp_id}")
-    os.makedirs(weights_dir, exist_ok=True)
-
     results_buffer = []
 
-    epoch_pbar = tqdm(range(MAX_EPOCHS), desc=f"\t- Exp {exp_id} Progress", leave=False)
+    if os.path.exists(last_ckpt_path) and os.path.exists(temp_file):
+        print(f"Resuming Exp {exp_id} from checkpoint...")
+        checkpoint = torch.load(last_ckpt_path, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"]
+        best_miou = checkpoint["best_miou"]
+        patience_counter = checkpoint["patience"]
+
+        with open(temp_file, mode="r") as f:
+            reader = csv.reader(f)
+            results_buffer = list(reader)
+    else:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+
+    epoch_pbar = tqdm(range(start_epoch, MAX_EPOCHS), desc=f"\t- Exp {exp_id} Progress", leave=False)
 
     for epoch in epoch_pbar:
         start_time = time.time()
@@ -239,13 +253,22 @@ def run_experiment(args):
         else:
             patience_counter += 1
 
+        torch.save({
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_miou": best_miou,
+            "patience": patience_counter
+        }, last_ckpt_path)
+
+        with open(temp_file, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerows(results_buffer)
+
         if patience_counter >= PATIENCE:
             print(f" Early stopping at epoch {epoch + 1}")
             break
-
-    with open(temp_file, mode="w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerows(results_buffer)
 
     update_map_status(exp_id)
 
@@ -329,11 +352,6 @@ def main():
                 if is_finished == "True":
                     last_exp_id = exp_id
                     continue
-
-                partial_res_file = os.path.join(TEMP_DIR, f"exp_{exp_id}.csv")
-                if os.path.exists(partial_res_file):
-                    os.remove(partial_res_file)
-                    print(f"Resetting incomplete experiment {exp_id}")
 
                 tasks_to_run.append((exp_id, grid[i]))
 
