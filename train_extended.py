@@ -7,7 +7,6 @@ import time
 import albumentations as A
 import numpy as np
 import torch
-import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -26,8 +25,8 @@ NUM_CLASSES = 4
 MAX_EPOCHS = 100
 PATIENCE = 15
 
-BATCH_SIZES = [4, 8]
-INPUT_SIZES = [372, 1024]
+BATCH_SIZES = [2, 8]
+INPUT_SIZES = [372]
 LEARNING_RATES = [3e-5, 3e-4]
 
 LOSS_CONFIGS = [
@@ -37,7 +36,7 @@ LOSS_CONFIGS = [
     ("CombinedLoss_0.75", 0.75),
 ]
 
-MAX_CONCURRENT_JOBS = 4
+NUM_DL_WORKERS = os.cpu_count()
 
 
 def get_loss_function(name, lovasz_weight, class_weights, device):
@@ -51,13 +50,15 @@ def get_loss_function(name, lovasz_weight, class_weights, device):
         raise ValueError(f"Unknown loss: {name}")
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch_idx):
     model.train()
     running_loss = 0.0
     intersection_total = np.zeros(NUM_CLASSES)
     union_total = np.zeros(NUM_CLASSES)
 
-    for images, masks, _ in dataloader:
+    pbar = tqdm(dataloader, desc=f"\t\t- Train Epoch {epoch_idx}", leave=False)
+
+    for images, masks, _ in pbar:
         images = images.to(device)
         masks = masks.to(device)
 
@@ -70,7 +71,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        running_loss += loss.item()
+        current_loss = loss.item()
+        running_loss += current_loss
 
         preds = torch.argmax(outputs, dim=1)
 
@@ -79,6 +81,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
             true_mask = (masks_cropped == c)
             intersection_total[c] += (pred_mask & true_mask).sum().item()
             union_total[c] += (pred_mask | true_mask).sum().item()
+
+        pbar.set_postfix({"loss": f"{current_loss:.4f}"})
 
     iou_per_class = intersection_total / (union_total + 1e-8)
     mean_iou = iou_per_class.mean()
@@ -93,14 +97,14 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     return metrics
 
 
-def validate_epoch(model, dataloader, criterion, device):
+def validate_epoch(model, dataloader, criterion, device, epoch_idx):
     model.eval()
     running_loss = 0.0
     intersection_total = np.zeros(NUM_CLASSES)
     union_total = np.zeros(NUM_CLASSES)
 
     with torch.no_grad():
-        for images, masks, _ in dataloader:
+        for images, masks, _ in tqdm(dataloader, desc=f"\t\t- Val Epoch {epoch_idx}", leave=False):
             images = images.to(device)
             masks = masks.to(device)
 
@@ -131,34 +135,36 @@ def validate_epoch(model, dataloader, criterion, device):
     return metrics
 
 
-def update_map_status(exp_id, lock):
-    if lock is None:
+def update_map_status(exp_id):
+    rows = []
+    if not os.path.exists(EXP_MAP_FILE):
         return
 
-    with lock:
-        rows = []
-        with open(EXP_MAP_FILE, mode="r", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader)
-            rows = list(reader)
+    with open(EXP_MAP_FILE, mode="r", newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
 
-        updated = False
-        for row in rows:
-            if int(row[0]) == exp_id:
-                row[-1] = "True"
-                updated = True
-                break
+    updated = False
+    for row in rows:
+        if int(row[0]) == exp_id:
+            row[-1] = "True"
+            updated = True
+            break
 
-        if updated:
-            with open(EXP_MAP_FILE, mode="w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(header)
-                writer.writerows(rows)
+    if updated:
+        with open(EXP_MAP_FILE, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(header)
+            writer.writerows(rows)
 
 
 def run_experiment(args):
-    exp_id, config, train_names, val_names, lock = args
+    exp_id, config, train_names, val_names = args
     batch_size, input_size, lr, (loss_name, lovasz_weight), mask = config
+
+    print(
+        f"\nState: Running Exp {exp_id} | BS={batch_size} | Size={input_size} | LR={lr} | Loss={loss_name} | Mask={mask}")
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     temp_file = os.path.join(TEMP_DIR, f"exp_{exp_id}.csv")
@@ -177,9 +183,9 @@ def run_experiment(args):
     val_dataset = BRIGHTDataset(DATA_DIR, val_names, target_size=input_size, channel_mask=mask, mode="val")
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=0, pin_memory=PIN_MEMORY, drop_last=True)
+                              num_workers=NUM_DL_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=max(1, batch_size // 2), shuffle=False,
-                            num_workers=0, pin_memory=PIN_MEMORY)
+                            num_workers=NUM_DL_WORKERS, pin_memory=PIN_MEMORY)
 
     in_channels = mask.count("1")
     model = UNet(in_channels=in_channels, out_channels=NUM_CLASSES).to(DEVICE)
@@ -200,11 +206,13 @@ def run_experiment(args):
 
     results_buffer = []
 
-    for epoch in range(MAX_EPOCHS):
+    epoch_pbar = tqdm(range(MAX_EPOCHS), desc=f"\t- Exp {exp_id} Progress", leave=False)
+
+    for epoch in epoch_pbar:
         start_time = time.time()
 
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, DEVICE)
-        val_metrics = validate_epoch(model, val_loader, criterion, DEVICE)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch + 1)
+        val_metrics = validate_epoch(model, val_loader, criterion, DEVICE, epoch + 1)
 
         duration = time.time() - start_time
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -219,6 +227,11 @@ def run_experiment(args):
 
         results_buffer.append(row)
 
+        epoch_pbar.set_postfix({
+            "Val mIoU": f"{val_metrics['miou']:.4f}",
+            "Train Loss": f"{train_metrics['loss']:.4f}"
+        })
+
         if val_metrics["miou"] > best_miou:
             best_miou = val_metrics["miou"]
             patience_counter = 0
@@ -227,17 +240,20 @@ def run_experiment(args):
             patience_counter += 1
 
         if patience_counter >= PATIENCE:
+            print(f" Early stopping at epoch {epoch + 1}")
             break
 
     with open(temp_file, mode="w", newline="") as f:
         writer = csv.writer(f)
         writer.writerows(results_buffer)
 
-    update_map_status(exp_id, lock)
+    update_map_status(exp_id)
 
     del model
     del optimizer
     del criterion
+    del train_loader
+    del val_loader
     torch.cuda.empty_cache()
 
 
@@ -254,7 +270,6 @@ def merge_results():
                     for row in reader:
                         all_rows.append(row)
 
-    # Sort: Exp ID (int) -> Epoch (int)
     all_rows.sort(key=lambda x: (int(x[0]), int(x[1])))
 
     header = ["exp_id", "epoch", "timestamp", "duration",
@@ -272,8 +287,6 @@ def merge_results():
 
 
 def main():
-    mp.set_start_method("spawn", force=True)
-
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
@@ -337,15 +350,12 @@ def main():
         merge_results()
         return
 
-    manager = mp.Manager()
-    file_lock = manager.Lock()
-
     final_tasks = []
     for exp_id, config in tasks_to_run:
-        final_tasks.append((exp_id, config, train_names, val_names, file_lock))
+        final_tasks.append((exp_id, config, train_names, val_names))
 
-    with mp.Pool(processes=MAX_CONCURRENT_JOBS) as pool:
-        list(tqdm(pool.imap_unordered(run_experiment, final_tasks), total=len(final_tasks), desc="Grid Search"))
+    for task_args in tqdm(final_tasks, desc="Grid Search Total Progress"):
+        run_experiment(task_args)
 
     merge_results()
 
