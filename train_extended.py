@@ -287,9 +287,7 @@ def merge_results():
 
 
 def main():
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR)
+    os.makedirs(TEMP_DIR, exist_ok=True)
 
     grid = list(itertools.product(BATCH_SIZES, INPUT_SIZES, LEARNING_RATES, LOSS_CONFIGS, CHANNEL_MASKS))
 
@@ -300,8 +298,6 @@ def main():
     np.random.shuffle(all_images)
     train_names = all_images[:train_size]
     val_names = all_images[train_size:train_size + 50]
-
-    os.makedirs(TEMP_DIR, exist_ok=True)
 
     resume_mode = os.path.exists(EXP_MAP_FILE)
     tasks_to_run = []
