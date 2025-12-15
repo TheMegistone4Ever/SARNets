@@ -205,7 +205,7 @@ def run_experiment(args):
 
     if os.path.exists(last_ckpt_path) and os.path.exists(temp_file):
         print(f"Resuming Exp {exp_id} from checkpoint...")
-        checkpoint = torch.load(last_ckpt_path, map_location=DEVICE)
+        checkpoint = torch.load(last_ckpt_path, map_location=DEVICE, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
