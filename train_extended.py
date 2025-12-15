@@ -24,6 +24,7 @@ CHANNEL_MASKS = ["100000", "111000", "111111", "000111"]
 NUM_CLASSES = 4
 MAX_EPOCHS = 100
 PATIENCE = 15
+PHYSICAL_BATCH_SIZE = 2
 
 BATCH_SIZES = [2, 8]
 INPUT_SIZES = [372]
@@ -50,7 +51,7 @@ def get_loss_function(name, lovasz_weight, class_weights, device):
         raise ValueError(f"Unknown loss: {name}")
 
 
-def train_epoch(model, dataloader, criterion, optimizer, device, epoch_idx):
+def train_epoch(model, dataloader, criterion, optimizer, device, epoch_idx, accumulation_steps=1):
     model.train()
     running_loss = 0.0
     intersection_total = np.zeros(NUM_CLASSES)
@@ -58,20 +59,25 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch_idx):
 
     pbar = tqdm(dataloader, desc=f"\t\t- Train Epoch {epoch_idx}", leave=False)
 
-    for images, masks, _ in pbar:
+    optimizer.zero_grad()
+
+    for i, (images, masks, _) in enumerate(pbar):
         images = images.to(device)
         masks = masks.to(device)
 
-        optimizer.zero_grad()
         outputs = model(images)
         masks_cropped = crop_tensor(masks, outputs)
 
         loss = criterion(outputs, masks_cropped)
+        loss = loss / accumulation_steps
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
 
-        current_loss = loss.item()
+        if (i + 1) % accumulation_steps == 0 or (i + 1) == len(dataloader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+        current_loss = loss.item() * accumulation_steps
         running_loss += current_loss
 
         preds = torch.argmax(outputs, dim=1)
@@ -163,6 +169,17 @@ def run_experiment(args):
     exp_id, config, train_names, val_names = args
     batch_size, input_size, lr, (loss_name, lovasz_weight), mask = config
 
+    if batch_size % PHYSICAL_BATCH_SIZE != 0:
+        raise ValueError(f"Target batch size ({batch_size}) must be divisible by physical "
+                         f"batch size ({PHYSICAL_BATCH_SIZE})! Adjust your BATCH_SIZES list.")
+
+    if batch_size > PHYSICAL_BATCH_SIZE:
+        accumulation_steps = batch_size // PHYSICAL_BATCH_SIZE
+        actual_bs = PHYSICAL_BATCH_SIZE
+    else:
+        accumulation_steps = 1
+        actual_bs = batch_size
+
     print(
         f"\nState: Running Exp {exp_id} | BS={batch_size} | Size={input_size} | LR={lr} | Loss={loss_name} | Mask={mask}")
 
@@ -182,9 +199,9 @@ def run_experiment(args):
                                   augmentations=train_transform, mode="train")
     val_dataset = BRIGHTDataset(DATA_DIR, val_names, target_size=input_size, channel_mask=mask, mode="val")
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+    train_loader = DataLoader(train_dataset, batch_size=actual_bs, shuffle=True,
                               num_workers=NUM_DL_WORKERS, pin_memory=PIN_MEMORY, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=max(1, batch_size // 2), shuffle=False,
+    val_loader = DataLoader(val_dataset, batch_size=max(1, actual_bs // 2), shuffle=False,
                             num_workers=NUM_DL_WORKERS, pin_memory=PIN_MEMORY)
 
     in_channels = mask.count("1")
@@ -225,7 +242,8 @@ def run_experiment(args):
     for epoch in epoch_pbar:
         start_time = time.time()
 
-        train_metrics = train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch + 1)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, DEVICE, epoch + 1,
+                                    accumulation_steps=accumulation_steps)
         val_metrics = validate_epoch(model, val_loader, criterion, DEVICE, epoch + 1)
 
         duration = time.time() - start_time
